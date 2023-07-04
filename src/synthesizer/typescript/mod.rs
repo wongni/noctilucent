@@ -1,7 +1,9 @@
 use crate::code::{CodeBuffer, IndentOptions};
 use crate::ir::conditions::ConditionIr;
+use crate::ir::constructor::ConstructorParameter;
 use crate::ir::mappings::{MappingInstruction, OutputType};
 use crate::ir::outputs::OutputInstruction;
+use crate::ir::conditions::ConditionInstruction;
 use crate::ir::reference::{Origin, PseudoParameter, Reference};
 use crate::ir::resources::{ResourceInstruction, ResourceIr};
 use crate::ir::CloudformationProgramIr;
@@ -15,7 +17,7 @@ use voca_rs::case::{camel_case, pascal_case};
 
 use super::Synthesizer;
 
-const INDENT: Cow<'static, str> = Cow::Borrowed("  ");
+const INDENT: Cow<'static, str> = Cow::Borrowed("    ");
 
 pub struct Typescript {
     // TODO: Put options in here for different outputs in typescript
@@ -104,12 +106,8 @@ impl Synthesizer for Typescript {
                 }
                 // NOTE: the property type can be inferred by the compiler...
                 class.line(format!(
-                    "public readonly {name}{option};",
+                    "public readonly {name};",
                     name = pretty_name(&op.name),
-                    option = match &op.condition {
-                        Some(_) => "?",
-                        None => "",
-                    }
                 ));
             }
             class.newline();
@@ -149,6 +147,8 @@ impl Synthesizer for Typescript {
             }
         }
 
+        emit_parameters(&ctor, &ir.constructor.inputs);
+
         emit_mappings(&ctor, &ir.mappings);
 
         if !ir.conditions.is_empty() {
@@ -160,6 +160,8 @@ impl Synthesizer for Typescript {
                 ctor.line(format!("const {} = {};", pretty_name(&cond.name), synthed));
             }
         }
+
+        emit_conditions(&ctor, &ir.conditions);
 
         ctor.newline();
         ctor.line("// Resources");
@@ -181,33 +183,11 @@ impl Synthesizer for Typescript {
             for op in &ir.outputs {
                 let var_name = pretty_name(&op.name);
                 let cond = op.condition.as_ref().map(|s| pretty_name(s));
-
-                if let Some(cond) = &cond {
-                    ctor.line(format!(
-                        "this.{var_name} = {cond}",
-                        cond = pretty_name(cond)
-                    ));
-                    ctor.text(format!("{INDENT}? "));
-                    let indented = ctor.indent(INDENT);
-                    emit_resource_ir(context, &indented, &op.value, Some("\n"));
-                    ctor.line(format!("{INDENT}: undefined;"));
-                } else {
-                    ctor.text(format!("this.{var_name} = "));
-                    emit_resource_ir(context, &ctor, &op.value, Some(";\n"));
-                }
+                ctor.text(format!("this.{var_name} = "));
+                emit_resource_ir(context, &ctor, &op.value, Some(";\n"), false, false);
 
                 if let Some(export) = &op.export {
-                    if let Some(cond) = cond {
-                        let indented = ctor.indent_with_options(IndentOptions {
-                            indent: INDENT,
-                            leading: Some(format!("if ({cond}) {{").into()),
-                            trailing: Some("}".into()),
-                            trailing_newline: true,
-                        });
-                        emit_cfn_output(context, &indented, op, export, &var_name);
-                    } else {
-                        emit_cfn_output(context, &ctor, op, export, &var_name);
-                    }
+                    emit_cfn_output(context, &ctor, op, export, &var_name, cond);
                 }
             }
         }
@@ -277,6 +257,7 @@ fn emit_cfn_output(
     op: &OutputInstruction,
     export: &ResourceIr,
     var_name: &str,
+    cond: Option<String>,
 ) {
     let output = output.indent_with_options(IndentOptions {
         indent: INDENT,
@@ -289,8 +270,11 @@ fn emit_cfn_output(
         output.line(format!("description: '{}',", description.escape_debug()));
     }
     output.text("exportName: ");
-    emit_resource_ir(context, &output, export, Some(",\n"));
+    emit_resource_ir(context, &output, export, Some(",\n"), false, false);
     output.line(format!("value: this.{var_name},"));
+    if cond.is_some() {
+        output.line(format!("condition: {}Condition,", cond.as_ref().unwrap()));
+    }
 }
 
 fn emit_resource(
@@ -301,52 +285,24 @@ fn emit_resource(
     let var_name = pretty_name(&reference.name);
     let service = reference.resource_type.service().to_lowercase();
 
-    let maybe_undefined = if let Some(cond) = &reference.condition {
-        append_references(output, reference);
+    append_references(output, reference);
 
+    output.line(format!(
+        "const {var_name} = new {service}.Cfn{rtype}(this, '{}', {{",
+        reference.name.escape_debug(),
+        rtype = reference.resource_type.type_name(),
+    ));
+    emit_resource_props(context, output.indent(INDENT), &reference.properties);
+    output.line("});");
+
+    if let Some(cond) = &reference.condition {
         output.line(format!(
-            "const {var_name} = {cond}",
+            "{var_name}.cfnOptions.condition = {cond}Condition;",
             cond = pretty_name(cond)
         ));
-
-        let output = output.indent(INDENT);
-
-        output.line(format!(
-            "? new {service}.Cfn{rtype}(this, '{}', {{",
-            reference.name.escape_debug(),
-            rtype = reference.resource_type.type_name(),
-        ));
-
-        let mid_output = output.indent(INDENT);
-        emit_resource_props(context, mid_output.indent(INDENT), &reference.properties);
-        mid_output.line("})");
-
-        output.line(": undefined;");
-
-        true
-    } else {
-        append_references(output, reference);
-        output.line(format!(
-            "const {var_name} = new {service}.Cfn{rtype}(this, '{}', {{",
-            reference.name.escape_debug(),
-            rtype = reference.resource_type.type_name(),
-        ));
-
-        emit_resource_props(context, output.indent(INDENT), &reference.properties);
-
-        output.line("});");
-
-        false
-    };
-
-    if maybe_undefined {
-        output.line(format!("if ({var_name} != null) {{"));
-        let indented = output.indent(INDENT);
-        emit_resource_attributes(context, &indented, reference, &var_name);
-        output.line("}");
-    } else {
-        emit_resource_attributes(context, output, reference, &var_name);
     }
+
+    emit_resource_attributes(context, output, reference, &var_name);
 }
 
 fn emit_resource_attributes(
@@ -367,7 +323,7 @@ fn emit_resource_attributes(
 
     if let Some(update_policy) = &reference.update_policy {
         output.text(format!("{var_name}.cfnOptions.updatePolicy = "));
-        emit_resource_ir(context, output, update_policy, Some(";"));
+        emit_resource_ir(context, output, update_policy, Some(";"), false, false);
     }
 
     if let Some(deletion_policy) = &reference.deletion_policy {
@@ -394,8 +350,8 @@ fn emit_resource_metadata(
     match metadata {
         ResourceIr::Object(_, entries) => {
             for (name, value) in entries {
-                output.text(format!("{name}: "));
-                emit_resource_ir(context, &output, value, Some(",\n"));
+                output.text(format!("'{name}': "));
+                emit_resource_ir(context, &output, value, Some(",\n"), true, false);
             }
         }
         unsupported => output.line(format!("/* {unsupported:?} */")),
@@ -408,8 +364,14 @@ fn emit_resource_props<S>(
     props: &IndexMap<String, ResourceIr, S>,
 ) {
     for (name, prop) in props {
-        output.text(format!("{}: ", pretty_name(name)));
-        emit_resource_ir(context, &output, prop, Some(",\n"));
+        let prop_name = pretty_name(name);
+        output.text(format!("{}: ", prop_name));
+        let keep_prop_name = 
+            prop_name.to_lowercase() == "assumerolepolicydocument" || 
+            prop_name.to_lowercase() == "policydocument";
+        // name property is usually a string not a resolvable 
+        let use_tenary_op = prop_name.to_lowercase().ends_with("name");
+        emit_resource_ir(context, &output, prop, Some(",\n"), keep_prop_name, use_tenary_op);
     }
 }
 
@@ -418,6 +380,8 @@ fn emit_resource_ir(
     output: &CodeBuffer,
     value: &ResourceIr,
     trailer: Option<&str>,
+    keep_prop_name: bool,
+    use_tenary_op: bool,
 ) {
     match value {
         // Literal values
@@ -436,7 +400,7 @@ fn emit_resource_ir(
                 trailing_newline: false,
             });
             for item in array {
-                emit_resource_ir(context, &arr, item, Some(",\n"));
+                emit_resource_ir(context, &arr, item, Some(",\n"), keep_prop_name, use_tenary_op);
             }
         }
         ResourceIr::Object(_, entries) => {
@@ -447,8 +411,12 @@ fn emit_resource_ir(
                 trailing_newline: false,
             });
             for (name, value) in entries {
-                obj.text(format!("{key}: ", key = pretty_name(name)));
-                emit_resource_ir(context, &obj, value, Some(",\n"));
+                if keep_prop_name { 
+                    obj.text(format!("'{}': ", name));
+                } else {
+                    obj.text(format!("'{}': ", pretty_name(name)));
+                }
+                emit_resource_ir(context, &obj, value, Some(",\n"), keep_prop_name, use_tenary_op);
             }
         }
 
@@ -463,29 +431,37 @@ fn emit_resource_ir(
             }
             other => {
                 output.text("cdk.Fn.base64(");
-                emit_resource_ir(context, output, other, None);
+                emit_resource_ir(context, output, other, None, false, use_tenary_op);
                 output.text(")")
             }
         },
         ResourceIr::Cidr(ip_range, count, mask) => {
             output.text("cdk.Fn.cidr(");
-            emit_resource_ir(context, output, ip_range, None);
+            emit_resource_ir(context, output, ip_range, None, false, use_tenary_op);
             output.text(", ");
-            emit_resource_ir(context, output, count, None);
+            emit_resource_ir(context, output, count, None, false, use_tenary_op);
             output.text(", String(");
-            emit_resource_ir(context, output, mask, None);
+            emit_resource_ir(context, output, mask, None, false, use_tenary_op);
             output.text("))")
         }
         ResourceIr::GetAZs(region) => {
             output.text("cdk.Fn.getAzs(");
-            emit_resource_ir(context, output, region, None);
+            emit_resource_ir(context, output, region, None, false, use_tenary_op);
             output.text(")")
         }
         ResourceIr::If(cond_name, if_true, if_false) => {
-            output.text(format!("{} ? ", pretty_name(cond_name)));
-            emit_resource_ir(context, output, if_true, None);
-            output.text(" : ");
-            emit_resource_ir(context, output, if_false, None)
+            if use_tenary_op {
+                output.text(format!("{} ? ", pretty_name(cond_name)));
+                emit_resource_ir(context, output, if_true, None, keep_prop_name, use_tenary_op);
+                output.text(" : ");
+                emit_resource_ir(context, output, if_false, None, keep_prop_name, use_tenary_op);
+            } else {
+                output.text(format!("cdk.Fn.conditionIf('{}', ", pascal_case(cond_name)));
+                emit_resource_ir(context, output, if_true, None, keep_prop_name, use_tenary_op);
+                output.text(", ");
+                emit_resource_ir(context, output, if_false, None, keep_prop_name, use_tenary_op);
+                output.text(")");
+            }
         }
         ResourceIr::ImportValue(name) => {
             output.text(format!("cdk.Fn.importValue('{}')", name.escape_debug()))
@@ -498,20 +474,20 @@ fn emit_resource_ir(
                 trailing_newline: false,
             });
             for item in list {
-                emit_resource_ir(context, &items, item, Some(",\n"));
+                emit_resource_ir(context, &items, item, Some(",\n"), false, use_tenary_op);
             }
         }
         ResourceIr::Map(name, tlk, slk) => {
             output.text(format!("{}[", pretty_name(name)));
-            emit_resource_ir(context, output, tlk, None);
+            emit_resource_ir(context, output, tlk, None, false, use_tenary_op);
             output.text("][");
-            emit_resource_ir(context, output, slk, None);
+            emit_resource_ir(context, output, slk, None, false, use_tenary_op);
             output.text("]")
         }
         ResourceIr::Select(idx, list) => match list.as_ref() {
             ResourceIr::Array(_, array) => {
                 if *idx <= array.len() {
-                    emit_resource_ir(context, output, &array[*idx], None)
+                    emit_resource_ir(context, output, &array[*idx], None, false, use_tenary_op);
                 } else {
                     output.text("undefined")
                 }
@@ -520,7 +496,7 @@ fn emit_resource_ir(
                 output.text("cdk.Fn.select(");
                 output.text(idx.to_string());
                 output.text(", ");
-                emit_resource_ir(context, output, other, None);
+                emit_resource_ir(context, output, other, None, false, use_tenary_op);
                 output.text(")")
             }
         },
@@ -531,23 +507,40 @@ fn emit_resource_ir(
             }
             other => {
                 output.text(format!("cdk.Fn.split('{sep}', ", sep = sep.escape_debug()));
-                emit_resource_ir(context, output, other, None);
+                emit_resource_ir(context, output, other, None, false, use_tenary_op);
                 output.text(")")
             }
         },
         ResourceIr::Sub(parts) => {
-            output.text("`");
+            output.text("cdk.Fn.sub('");
             for part in parts {
                 match part {
                     ResourceIr::String(lit) => output.text(lit.clone()),
+                    ResourceIr::Ref(reference) => {
+                        output.text("${");
+                        match &reference.origin {
+                            Origin::PseudoParameter(x) => match x {
+                                PseudoParameter::Partition => output.text("AWS::Partition"),
+                                PseudoParameter::Region => output.text("AWS::Region"),
+                                PseudoParameter::StackId => output.text("AWS::StackId"),
+                                PseudoParameter::StackName => output.text("AWS::StackName"),
+                                PseudoParameter::URLSuffix => output.text("AWS::URLSuffix"),
+                                PseudoParameter::AccountId => output.text("AWS::AccountId"),
+                                PseudoParameter::NotificationArns => output.text("AWS::NotificationArns"),
+                            },
+                            Origin::Parameter => output.text(format!("{}", pascal_case(&reference.name))),
+                            _other => output.text(reference.to_typescript()),
+                        };
+                        output.text("}");
+                    },
                     other => {
                         output.text("${");
-                        emit_resource_ir(context, output, other, None);
+                        emit_resource_ir(context, output, other, None, false, use_tenary_op);
                         output.text("}");
                     }
                 }
             }
-            output.text("`")
+            output.text("')")
         }
 
         // References
@@ -556,6 +549,42 @@ fn emit_resource_ir(
 
     if let Some(trailer) = trailer {
         output.text(trailer.to_owned())
+    }
+}
+
+fn emit_parameters(output: &CodeBuffer, parameters: &[ConstructorParameter]) {
+    if parameters.is_empty() {
+        return;
+    }
+
+    output.newline();
+    output.line("// Parameters");
+
+    for parameter in parameters {
+        let var_name = pretty_name(&parameter.name);
+        let output = output.indent_with_options(IndentOptions {
+            indent: INDENT,
+            leading: Some(
+                format!(
+                    "const {var_name}Parameter = new cdk.CfnParameter(this, \"{pascal_var_name}\", {{",
+                    pascal_var_name = pascal_case(&var_name)
+                )
+                .into(),
+            ),
+            trailing: Some("});".into()),
+            trailing_newline: true,
+        });
+        if parameter.default_value.is_some() {
+            let default_value = parameter.default_value.as_ref().unwrap();
+            output.line(format!("default: \"{}\",", default_value));
+            if default_value == "true" || default_value == "false" {
+                output.line("allowedValues:[\"true\", \"false\"],");
+            }
+        }
+        if parameter.description.is_some() {
+            output.line(format!("description: \"{}\",", parameter.description.as_ref().unwrap()));
+        }
+        output.line(format!("type: \"{}\",", parameter.constructor_type));
     }
 }
 
@@ -578,21 +607,52 @@ fn emit_mappings(output: &CodeBuffer, mappings: &[MappingInstruction]) {
             OutputType::Complex => "any",
         };
 
+        let var_name = pretty_name(&mapping.name);
         let output = output.indent_with_options(IndentOptions {
             indent: INDENT,
             leading: Some(
                 format!(
-                    "const {var}: Record<string, Record<string, {item_type}>> = {{",
-                    var = pretty_name(&mapping.name)
+                    "const {var_name}: Record<string, Record<string, {item_type}>> = {{"
                 )
                 .into(),
             ),
-            trailing: Some("};".into()),
+            trailing: Some(
+                format!(
+                    "}};\nnew cdk.CfnMapping(this, \"{pascal_var_name}\", {{ mapping: {var_name} }});",
+                    pascal_var_name = pascal_case(&var_name)
+                ).into(),
+            ),
             trailing_newline: true,
         });
 
         emit_mapping_instruction(output, mapping);
     }
+}
+
+fn emit_conditions(output: &CodeBuffer, conditions: &[ConditionInstruction]) {
+    if !conditions.is_empty() {
+        output.newline();
+        output.line("// Conditions");
+
+        for cond in conditions {
+            let cond_name = &cond.name;
+            let output = output.indent_with_options(IndentOptions {
+                indent: INDENT,
+                leading: Some(
+                    format!(
+                        "const {var_name}Condition = new cdk.CfnCondition(this, \"{cond_name}\", {{ expression: ",
+                        var_name = pretty_name(cond_name),
+                    )
+                    .into(),
+                ),
+                trailing: Some("});".into()),
+                trailing_newline: true,
+            });
+
+            let synthed = synthesize_cfn_condition_recursive(&cond.value);
+            output.line(synthed);
+        }
+    }    
 }
 
 fn synthesize_condition_recursive(val: &ConditionIr) -> String {
@@ -646,6 +706,71 @@ fn synthesize_condition_recursive(val: &ConditionIr) -> String {
         }
         ConditionIr::Select(index, l1) => {
             let str = synthesize_condition_recursive(l1.as_ref());
+            format!("cdk.Fn.select({index}, {str})")
+        }
+    }
+}
+
+fn synthesize_cfn_condition_recursive(val: &ConditionIr) -> String {
+    match val {
+        ConditionIr::And(x) => {
+            let a: Vec<String> = x.iter().map(synthesize_cfn_condition_recursive).collect();
+
+            let inner = a.join(",\n");
+            format!("cdk.Fn.conditionAnd({inner})")
+        }
+        ConditionIr::Equals(a, b) => {
+            format!(
+                "cdk.Fn.conditionEquals({}, {})",
+                synthesize_cfn_condition_recursive(a.as_ref()),
+                synthesize_cfn_condition_recursive(b.as_ref())
+            )
+        }
+        ConditionIr::Not(x) => {
+            format!("cdk.Fn.conditionNot({})", synthesize_cfn_condition_recursive(x.as_ref()))
+        }
+        ConditionIr::Or(x) => {
+            let a: Vec<String> = x.iter().map(synthesize_cfn_condition_recursive).collect();
+
+            let inner = a.join(",\n");
+            format!("cdk.Fn.conditionOr({inner})")
+        }
+        ConditionIr::Str(x) => {
+            format!("'{x}'")
+        }
+        ConditionIr::Condition(x) => format!("{}", pretty_name(x)),
+        ConditionIr::Ref(x) => match &x.origin {
+            Origin::Condition => format!("{}Condition", camel_case(&x.name)).into(),
+            Origin::Parameter => format!("{}Parameter", camel_case(&x.name)).into(),
+            Origin::PseudoParameter(param) => match param {
+                PseudoParameter::Partition => "cdk.Aws.PARTITION".into(),
+                PseudoParameter::Region => "cdk.Aws.REGION".into(),
+                PseudoParameter::StackId => "cdk.Aws.STACK_ID".into(),
+                PseudoParameter::StackName => "cdk.Aws.STACK_NAME".into(),
+                PseudoParameter::URLSuffix => "cdk.Aws.URL_SUFFIX".into(),
+                PseudoParameter::AccountId => "cdk.Aws.ACCOUNT_ID".into(),
+                PseudoParameter::NotificationArns => "cdk.Aws.NOTIFICATION_ARNS".into(),
+            },
+            _other => x.to_typescript().into()
+        }
+        ConditionIr::Map(named_resource, l1, l2) => {
+            format!(
+                "cdk.Fn.findInMap('{}', {}, {})",
+                pascal_case(named_resource),
+                synthesize_cfn_condition_recursive(l1.as_ref()),
+                synthesize_cfn_condition_recursive(l2.as_ref())
+            )
+        }
+        ConditionIr::Split(sep, l1) => {
+            let str = synthesize_cfn_condition_recursive(l1.as_ref());
+            format!(
+                "cdk.Fn.split('{sep}', {str})",
+                str = str.escape_debug(),
+                sep = sep.escape_debug()
+            )
+        }
+        ConditionIr::Select(index, l1) => {
+            let str = synthesize_cfn_condition_recursive(l1.as_ref());
             format!("cdk.Fn.select({index}, {str})")
         }
     }
