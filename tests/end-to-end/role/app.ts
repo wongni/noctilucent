@@ -1,11 +1,11 @@
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 
-export interface NoctStackProps extends cdk.StackProps {
+export interface RoleStackProps extends cdk.StackProps {
 }
 
-export class NoctStack extends cdk.Stack {
-  public constructor(scope: cdk.App, id: string, props: NoctStackProps = {}) {
+export class RoleStack extends cdk.Stack {
+  public constructor(scope: cdk.App, id: string, props: RoleStackProps = {}) {
     super(scope, id, props);
 
     // Resources

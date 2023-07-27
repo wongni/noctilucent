@@ -9,15 +9,15 @@ import (
 	"github.com/aws/jsii-runtime-go"
 )
 
-type NoctStackProps struct {
+type RoleStackProps struct {
 	cdk.StackProps
 }
 
-type NoctStack struct {
+type RoleStack struct {
 	cdk.Stack
 }
 
-func NewNoctStack(scope constructs.Construct, id string, props NoctStackProps) *NoctStack {
+func NewRoleStack(scope constructs.Construct, id string, props RoleStackProps) *RoleStack {
 	stack := cdk.NewStack(scope, &id, &props.StackProps)
 
 	iam.NewCfnRole(
@@ -48,7 +48,7 @@ func NewNoctStack(scope constructs.Construct, id string, props NoctStackProps) *
 		},
 	)
 
-	return &NoctStack{
+	return &RoleStack{
 		Stack: stack,
 	}
 }
